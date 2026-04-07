@@ -45,9 +45,9 @@ class Config:
     HOME_LAT         = 10.0478
     HOME_LON         = 76.3303
 
-    # ── Output folder: save directly into the missions folder Mission Planner reads ──
+    # ── Output folder: .waypoints files are saved here; drop your KML files here too ──
     _SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
-    OUTPUT_DIR       = os.path.normpath(os.path.join(_SCRIPT_DIR, '..', 'drone1_ws', 'missions'))
+    OUTPUT_DIR       = os.path.join(_SCRIPT_DIR, 'missions')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
