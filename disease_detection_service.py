@@ -33,9 +33,11 @@ import os
 import sys
 import csv
 import math
+import re
 import time
 import threading
 import argparse
+import configparser
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
@@ -99,7 +101,7 @@ class Config:
 
     # ── Output ────────────────────────────────────────────────────────────────
     _SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
-    OUTPUT_DIR       = _SCRIPT_DIR     # CSVs saved alongside this script
+    OUTPUT_DIR       = os.path.join(_SCRIPT_DIR, 'missions')  # CSVs saved in missions/
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -107,10 +109,11 @@ class Config:
 # ══════════════════════════════════════════════════════════════════════════════
 @dataclass
 class GpsState:
-    lat:    float = Config.GPS_FALLBACK_LAT
-    lon:    float = Config.GPS_FALLBACK_LON
-    alt:    float = Config.GPS_FALLBACK_ALT
-    fix:    bool  = False               # True = real MAVLink fix
+    lat:        float = Config.GPS_FALLBACK_LAT
+    lon:        float = Config.GPS_FALLBACK_LON
+    alt:        float = Config.GPS_FALLBACK_ALT
+    fix:        bool  = False               # True = real MAVLink fix
+    status_str: str   = "NO FIX"            # last 'gps status' console response
 
 
 @dataclass
@@ -140,14 +143,102 @@ class GpsReader(threading.Thread):
 
     def __init__(self, state: GpsState, port: str, baud: int):
         super().__init__(daemon=True)
-        self.state   = state
-        self.port    = port
-        self.baud    = baud
-        self._stop   = threading.Event()
+        self.state     = state
+        self.port      = port
+        self.baud      = baud
+        self._stop     = threading.Event()
         self.connected = False
+        self._conn     = None               # MAVLink connection handle
 
     def stop(self):
         self._stop.set()
+
+    # ── MAVLink console helpers ──────────────────────────────────────────────
+
+    def _send_console_command(self, cmd: str) -> Optional[str]:
+        """
+        Send a command string to the ArduPilot MAVLink shell console via
+        SERIAL_CONTROL and collect the text response (up to 2 s).
+        Returns the stripped response string, or None on failure.
+        """
+        if self._conn is None:
+            return None
+        try:
+            encoded  = (cmd + "\n").encode('utf-8')
+            payload  = list(encoded[:70]) + [0] * max(0, 70 - len(encoded))
+            self._conn.mav.serial_control_send(
+                mavutil.mavlink.SERIAL_CONTROL_DEV_SHELL,
+                mavutil.mavlink.SERIAL_CONTROL_FLAG_RESPOND |
+                mavutil.mavlink.SERIAL_CONTROL_FLAG_EXCLUSIVE,
+                0, 0,
+                min(len(encoded), 70),
+                payload,
+            )
+            response = ""
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                msg = self._conn.recv_match(
+                    type='SERIAL_CONTROL', blocking=True, timeout=0.3)
+                if msg and msg.count > 0:
+                    response += bytes(msg.data[:msg.count]).decode(
+                        'utf-8', errors='ignore')
+                    if '\n' in response:
+                        break
+            return response.strip() or None
+        except Exception as exc:
+            print(f"[GPS]   Console command error: {exc}")
+            return None
+
+    def query_gps_status(self) -> Optional[str]:
+        """
+        Call 'gps status' on the FC console.
+        Parses Lat/Lon from the response and updates self.state if found.
+        Returns the raw status string, or None if the console is unavailable.
+
+        ArduPilot console example output:
+          GPS 1: OK  Fix=3D_FIX  HDop=1.22  Lat=10.047938  Lon=76.330005  Alt=6.7 …
+        """
+        resp = self._send_console_command("gps status")
+        if not resp:
+            return None
+
+        self.state.status_str = resp
+        print(f"[GPS]   Console → gps status: {resp}")
+
+        # Parse Lat and Lon from the response (handles = or : separator, optional spaces)
+        lat_m = re.search(r'[Ll]at[=:\s]+(-?\d+\.\d+)', resp)
+        lon_m = re.search(r'[Ll]on[=:\s]+(-?\d+\.\d+)', resp)
+        alt_m = re.search(r'[Aa]lt[=:\s]+(-?\d+\.?\d*)', resp)
+
+        if lat_m and lon_m:
+            self.state.lat = float(lat_m.group(1))
+            self.state.lon = float(lon_m.group(1))
+            if alt_m:
+                self.state.alt = float(alt_m.group(1))
+            self.state.fix = True
+            print(f"[GPS]   Parsed from console → "
+                  f"lat={self.state.lat:.6f}  lon={self.state.lon:.6f}  "
+                  f"alt={self.state.alt:.1f} m")
+
+        return resp
+
+    def _request_gps_stream(self, conn):
+        """
+        Request GPS messages using MAV_CMD_SET_MESSAGE_INTERVAL (modern MAVLink).
+        Asks for GLOBAL_POSITION_INT and GPS_RAW_INT at Config.TARGET_FPS Hz.
+        """
+        interval_us = int(1e6 / Config.TARGET_FPS)
+        for msg_id in (mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
+                       mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT):
+            conn.mav.command_long_send(
+                conn.target_system,
+                conn.target_component,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0,
+                msg_id,
+                interval_us,
+                0, 0, 0, 0, 0,
+            )
 
     def run(self):
         if not HAS_MAVLINK:
@@ -156,12 +247,17 @@ class GpsReader(threading.Thread):
         print(f"[GPS]   Connecting to {self.port} @ {self.baud} baud ...")
         try:
             conn = mavutil.mavlink_connection(self.port, baud=self.baud)
-            conn.wait_heartbeat(timeout=10)
-            print(f"[GPS]   Heartbeat received from system "
-                  f"{conn.target_system} / component {conn.target_component}")
-            conn.mav.request_data_stream_send(
-                conn.target_system, conn.target_component,
-                mavutil.mavlink.MAV_DATA_STREAM_POSITION, 5, 1)   # 5 Hz
+            conn.wait_heartbeat()
+            self._conn = conn
+            print(f"[GPS]   Connected  (System {conn.target_system}, "
+                  f"Component {conn.target_component})")
+
+            # Query 'gps status' via FC console immediately on connect
+            self.query_gps_status()
+
+            # Request GPS streams via MAV_CMD_SET_MESSAGE_INTERVAL
+            self._request_gps_stream(conn)
+            print(f"[GPS]   GPS stream requested at {Config.TARGET_FPS} Hz")
             self.connected = True
         except Exception as e:
             print(f"[GPS]   Connection failed: {e}")
@@ -171,23 +267,27 @@ class GpsReader(threading.Thread):
 
         while not self._stop.is_set():
             try:
-                msg = conn.recv_match(
-                    type=['GLOBAL_POSITION_INT', 'GPS_RAW_INT'],
-                    blocking=True, timeout=2.0
-                )
-                if msg is None:
+                msg = conn.recv_match(blocking=True)
+                if not msg:
                     continue
                 t = msg.get_type()
+
                 if t == 'GLOBAL_POSITION_INT':
-                    self.state.lat = msg.lat  / 1e7
-                    self.state.lon = msg.lon  / 1e7
-                    self.state.alt = msg.alt  / 1000.0   # mm → m
+                    self.state.lat = msg.lat / 1e7
+                    self.state.lon = msg.lon / 1e7
+                    self.state.alt = msg.alt / 1000.0   # mm → m
                     self.state.fix = True
-                elif t == 'GPS_RAW_INT' and msg.fix_type >= 3:
-                    self.state.lat = msg.lat  / 1e7
-                    self.state.lon = msg.lon  / 1e7
-                    self.state.alt = msg.alt  / 1000.0
-                    self.state.fix = True
+
+                elif t == 'GPS_RAW_INT':
+                    sats = msg.satellites_visible
+                    fix  = msg.fix_type
+                    if fix >= 3:                        # 3D fix or better
+                        self.state.lat = msg.lat / 1e7
+                        self.state.lon = msg.lon / 1e7
+                        self.state.alt = msg.alt / 1000.0
+                        self.state.fix = True
+
+                time.sleep(0.01)
             except Exception:
                 time.sleep(0.1)
 
@@ -423,12 +523,14 @@ class DiseaseDetector:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def init_csv(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     if not os.path.isfile(path):
         with open(path, 'w', newline='') as f:
             csv.writer(f).writerow([
                 'Timestamp', 'Detection_ID', 'Latitude', 'Longitude',
-                'Altitude_m', 'GPS_Source', 'Severity', 'Severity_Score',
-                'Area_px', 'Pixel_X', 'Pixel_Y', 'Status',
+                'Altitude_m', 'GPS_Source', 'GPS_Console_Status',
+                'Severity', 'Severity_Score', 'Area_px',
+                'Pixel_X', 'Pixel_Y', 'Status',
             ])
 
 
@@ -441,6 +543,7 @@ def log_csv(path: str, det: Detection, det_id: int, gps: GpsState):
             f'{det.longitude:.8f}',
             f'{gps.alt:.2f}',
             'LIVE' if gps.fix else 'FALLBACK',
+            gps.status_str,           # raw 'gps status' console response
             det.severity,
             det.severity_score,
             det.area,
@@ -454,29 +557,60 @@ def log_csv(path: str, det: Detection, det_id: int, gps: GpsState):
 # MAIN SERVICE LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Arkairo Plant Disease Detection Service')
-    parser.add_argument('--port',   default=Config.SERIAL_PORT,
-                        help='MAVLink port (e.g. COM3, /dev/ttyUSB0, udp:0.0.0.0:14551)')
-    parser.add_argument('--baud',   type=int, default=Config.BAUD,
-                        help='Serial baud rate (default 57600)')
-    parser.add_argument('--cam',    default=None,
-                        help='Camera source: 0/1 for USB cam, path or RTSP URL')
-    parser.add_argument('--no-gui', action='store_true',
-                        help='Disable OpenCV window (headless mode)')
-    args = parser.parse_args()
+def load_mode_config(mode: str) -> dict:
+    """
+    Read config.ini and return the settings dict for the requested mode.
+    Falls back to Config class defaults if the file or section is missing.
+    """
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
+    cp = configparser.ConfigParser()
+    cp.read(cfg_path, encoding='utf-8')
 
-    cam_source = int(args.cam) if (args.cam and args.cam.isdigit()) else \
-                 (args.cam if args.cam else Config.CAMERA_SOURCE)
-    show_gui   = Config.SHOW_GUI and not args.no_gui
+    if not cp.has_section(mode):
+        print(f"[CFG]   Mode '{mode}' not found in config.ini — using defaults")
+        return {}
+
+    print(f"[CFG]   Loaded mode '{mode}' from config.ini")
+    return dict(cp[mode])
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Arkairo Plant Disease Detection Service')
+    ap.add_argument('--mode',   default='dev',
+                    help='Config mode: dev | pi5  (matches section in config.ini)')
+    ap.add_argument('--port',   default=None,
+                    help='Override MAVLink port (e.g. COM3, /dev/ttyUSB0, udp:…)')
+    ap.add_argument('--baud',   type=int, default=None,
+                    help='Override serial baud rate')
+    ap.add_argument('--cam',    default=None,
+                    help='Override camera source: 0/1 for USB, path or RTSP URL')
+    ap.add_argument('--no-gui', action='store_true',
+                    help='Disable OpenCV window (headless mode)')
+    args = ap.parse_args()
+
+    # ── Merge config.ini → CLI overrides ─────────────────────────────────────
+    cfg = load_mode_config(args.mode)
+
+    def _get(key, cli_val, default):
+        if cli_val is not None:
+            return cli_val
+        return cfg.get(key, default)
+
+    serial_port = _get('serial_port', args.port,  Config.SERIAL_PORT)
+    baud        = int(_get('baud',    args.baud,   Config.BAUD))
+    show_gui    = not args.no_gui and cfg.get('show_gui', str(Config.SHOW_GUI)).lower() != 'false'
+
+    raw_cam = _get('camera_source', args.cam, str(Config.CAMERA_SOURCE))
+    cam_source = int(raw_cam) if str(raw_cam).isdigit() else raw_cam
 
     print()
     print("═" * 64)
     print("  ARKAIRO — Disease Detection & Geotagging Service")
     print("═" * 64)
+    print(f"  Mode    : {args.mode}")
     print(f"  Camera  : {cam_source}")
-    print(f"  MAVLink : {args.port} @ {args.baud} baud")
+    print(f"  MAVLink : {serial_port} @ {baud} baud")
     print(f"  Output  : {Config.OUTPUT_DIR}")
     print(f"  GUI     : {'on' if show_gui else 'off  (headless)'}")
     print("  Press   : Ctrl+C to stop")
@@ -485,7 +619,7 @@ def main():
 
     # ── GPS reader thread ─────────────────────────────────────────────────────
     gps = GpsState()
-    gps_thread = GpsReader(gps, args.port, args.baud)
+    gps_thread = GpsReader(gps, serial_port, baud)
     gps_thread.start()
 
     # ── Camera ────────────────────────────────────────────────────────────────
@@ -499,9 +633,9 @@ def main():
           f"({int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}×"
           f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))})")
 
-    # ── CSV ───────────────────────────────────────────────────────────────────
-    today    = datetime.now().strftime('%Y%m%d')
-    csv_path = os.path.join(Config.OUTPUT_DIR, f"disease_log_{today}.csv")
+    # ── CSV (missions/ folder) ────────────────────────────────────────────────
+    ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_path = os.path.join(Config.OUTPUT_DIR, f"disease_geotag_{ts}.csv")
     init_csv(csv_path)
     print(f"[LOG]   CSV log: {csv_path}")
     print()
@@ -528,14 +662,18 @@ def main():
                 time.sleep(0.005)
                 continue
 
-            dt          = now - last_process if last_process > 0 else min_interval
-            fps_ema     = 0.9 * fps_ema + 0.1 * (1.0 / dt) if fps_ema > 0 else 1.0 / dt
+            dt           = now - last_process if last_process > 0 else min_interval
+            fps_ema      = 0.9 * fps_ema + 0.1 * (1.0 / dt) if fps_ema > 0 else 1.0 / dt
             last_process = now
 
-            # ── Detection ─────────────────────────────────────────────────────
+            # ── Yellow detection ──────────────────────────────────────────────
             detections, _, _ = detector.detect(frame, gps)
 
-            # ── Log detected blobs ────────────────────────────────────────────
+            # ── Geotag & log ──────────────────────────────────────────────────
+            if detections and gps_thread.connected:
+                # Refresh GPS coordinates via FC console 'gps status' command
+                gps_thread.query_gps_status()
+
             for det in detections:
                 log_csv(csv_path, det, detector.total_detections, gps)
                 src = "LIVE" if gps.fix else "fallback"

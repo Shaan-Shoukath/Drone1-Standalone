@@ -1,0 +1,19 @@
+# Arkairo Disease Detection Service — Python dependencies
+#
+# Install all at once:
+#   pip install -r requirements.txt
+#
+# On Raspberry Pi 5, prefer the system OpenCV package for camera support:
+#   sudo apt install python3-opencv
+# and install the rest with:
+#   pip install -r requirements.txt --ignore-installed opencv-python
+
+# Core vision
+opencv-python>=4.8.0
+
+# Numerical operations (used by OpenCV internally — pin for stability)
+numpy>=1.24.0
+
+# MAVLink / drone telemetry
+pymavlink>=2.4.40
+pyserial>=3.5        # required by pymavlink for serial (COM) port connections
