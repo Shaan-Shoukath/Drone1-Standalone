@@ -20,6 +20,8 @@ This folder contains two **standalone scripts** that replicate the core logic wi
 
 ### 1 — Waypoint Generator
 
+![Waypoints Preview](images/waypoints%20test.jpeg)
+
 ```bash
 # Use the embedded SOE sports-field demo polygon (no file needed):
 python waypoint_generator.py
@@ -45,6 +47,8 @@ Open it in **Mission Planner → Flight Plan → Load WP**, connect your drone, 
 ---
 
 ### 2 — Disease Detection Service
+
+![Disease Detection Preview](images/detect%20and%20geotag.png)
 
 ```bash
 pip install opencv-python numpy pymavlink
